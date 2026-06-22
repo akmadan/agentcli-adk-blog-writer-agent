@@ -1,0 +1,382 @@
+template:
+  name: Agents CLI ADK Deploy to Agent Runtime
+  identifier: Agents_CLI_ADK_Deploy_to_Agent_Runtime
+  versionLabel: v1
+  type: Pipeline
+  projectIdentifier: akshitdevrelharness
+  orgIdentifier: default
+  tags: {}
+  spec:
+    properties:
+      ci:
+        codebase:
+          connectorRef: <+input>
+          repoName: <+input>
+          build: <+input>
+    stages:
+      - stage:
+          name: Build Test and Deploy
+          identifier: build_test_deploy
+          description: ""
+          type: CI
+          spec:
+            cloneCodebase: true
+            platform:
+              os: Linux
+              arch: Amd64
+            runtime:
+              type: Cloud
+              spec: {}
+            envVariables:
+              GOOGLE_GENAI_USE_VERTEXAI: "true"
+              GOOGLE_CLOUD_PROJECT: <+secrets.getValue("gcp_project_id")>
+              GOOGLE_CLOUD_LOCATION: <+secrets.getValue("gcp_region")>
+              GOOGLE_CLOUD_STORAGE_BUCKET: <+secrets.getValue("gcp_storage_bucket")>
+              GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-sa-key.json
+            execution:
+              steps:
+
+                # ── Step 1: Validate agents-cli project structure ──
+                - step:
+                    type: Run
+                    name: Validate Project Structure
+                    identifier: validate_project_structure
+                    spec:
+                      shell: Bash
+                      command: |
+                        echo "=== Validating Agents CLI ADK project structure ==="
+                        ERRORS=0
+
+                        # --- Manifest checks ---
+                        if [ ! -f "agents-cli-manifest.yaml" ]; then
+                          echo "FAIL: agents-cli-manifest.yaml not found. Is this an agents-cli project?"
+                          exit 1
+                        fi
+                        echo "  OK: agents-cli-manifest.yaml"
+
+                        # Extract agent_directory from manifest
+                        AGENT_DIR=$(grep '^agent_directory:' agents-cli-manifest.yaml | awk '{print $2}' | tr -d '"')
+                        if [ -z "$AGENT_DIR" ]; then
+                          echo "FAIL: Could not read agent_directory from agents-cli-manifest.yaml"
+                          exit 1
+                        fi
+                        echo "  OK: agent_directory = $AGENT_DIR"
+
+                        # Persist for downstream steps
+                        echo "$AGENT_DIR" > /tmp/agent_directory.txt
+
+                        # Verify deployment_target is agent_runtime
+                        DEPLOY_TARGET=$(grep 'deployment_target:' agents-cli-manifest.yaml | awk '{print $2}' | tr -d '"')
+                        if [ "$DEPLOY_TARGET" != "agent_runtime" ]; then
+                          echo "FAIL: deployment_target is '$DEPLOY_TARGET', expected 'agent_runtime'"
+                          ERRORS=$((ERRORS + 1))
+                        else
+                          echo "  OK: deployment_target = agent_runtime"
+                        fi
+
+                        # --- Required project-level files ---
+                        for f in "pyproject.toml" "uv.lock"; do
+                          if [ ! -f "$f" ]; then
+                            echo "FAIL: Missing $f"
+                            ERRORS=$((ERRORS + 1))
+                          else
+                            echo "  OK: $f"
+                          fi
+                        done
+
+                        # --- Required agent package files ---
+                        for f in "$AGENT_DIR/__init__.py" "$AGENT_DIR/agent.py" "$AGENT_DIR/prompt.py"; do
+                          if [ ! -f "$f" ]; then
+                            echo "FAIL: Missing $f"
+                            ERRORS=$((ERRORS + 1))
+                          else
+                            echo "  OK: $f"
+                          fi
+                        done
+
+                        # agent_runtime_app.py (required for Agent Runtime deployment)
+                        if [ ! -f "$AGENT_DIR/agent_runtime_app.py" ]; then
+                          echo "WARN: Missing $AGENT_DIR/agent_runtime_app.py (may be required for Agent Runtime)"
+                        else
+                          echo "  OK: $AGENT_DIR/agent_runtime_app.py"
+                        fi
+
+                        # --- Required directories ---
+                        if [ ! -d "$AGENT_DIR" ]; then
+                          echo "FAIL: Agent directory '$AGENT_DIR/' not found"
+                          ERRORS=$((ERRORS + 1))
+                        fi
+                        if [ ! -d "tests" ]; then
+                          echo "WARN: tests/ directory not found"
+                        else
+                          echo "  OK: tests/"
+                        fi
+
+                        # --- Dependency checks ---
+                        if grep -q "google-adk" pyproject.toml; then
+                          echo "  OK: google-adk dependency present in pyproject.toml"
+                        else
+                          echo "FAIL: google-adk dependency missing from pyproject.toml"
+                          ERRORS=$((ERRORS + 1))
+                        fi
+
+                        # --- root_agent or app entrypoint ---
+                        if grep -q "root_agent\|^app\s*=" "$AGENT_DIR/agent.py"; then
+                          echo "  OK: Agent entrypoint found in $AGENT_DIR/agent.py"
+                        else
+                          echo "FAIL: Neither root_agent nor app found in $AGENT_DIR/agent.py"
+                          ERRORS=$((ERRORS + 1))
+                        fi
+
+                        if [ $ERRORS -gt 0 ]; then
+                          echo ""
+                          echo "FAILED: $ERRORS validation error(s) found."
+                          exit 1
+                        fi
+
+                        echo ""
+                        echo "All validations passed for agents-cli project ($AGENT_DIR)."
+
+                # ── Step 2: Install dependencies (all groups) ──
+                - step:
+                    type: Run
+                    name: Install Dependencies
+                    identifier: install_dependencies
+                    spec:
+                      shell: Bash
+                      command: |
+                        echo "=== Installing uv ==="
+                        curl -LsSf https://astral.sh/uv/install.sh | sh
+                        export PATH="$HOME/.local/bin:$PATH"
+
+                        echo "=== Installing Google Agents CLI ==="
+                        uv tool install google-agents-cli
+                        export PATH="$(uv tool dir)/bin:$PATH"
+
+                        echo "=== Syncing project dependencies ==="
+                        # Install all available dependency groups
+                        SYNC_CMD="uv sync"
+                        for group in dev deployment; do
+                          if grep -qP "^\[dependency-groups\]" pyproject.toml && grep -qP "^${group}\s*=" pyproject.toml; then
+                            SYNC_CMD="$SYNC_CMD --group $group"
+                          fi
+                        done
+                        echo "Running: $SYNC_CMD"
+                        $SYNC_CMD
+
+                        echo "=== Verifying adk is available ==="
+                        uv run adk --version
+
+                        echo "=== Verifying agents-cli ==="
+                        agents-cli info --json
+
+                        echo "Dependencies installed successfully."
+
+                # ── Step 3: Setup GCP credentials ──
+                - step:
+                    type: Run
+                    name: Setup GCP Credentials
+                    identifier: setup_gcp_credentials
+                    spec:
+                      shell: Bash
+                      command: |
+                        echo "=== Configuring GCP service account credentials ==="
+                        echo '<+secrets.getValue("gcp_sa_key_json")>' > /tmp/gcp-sa-key.json
+                        chmod 600 /tmp/gcp-sa-key.json
+
+                        export PATH="$HOME/.local/bin:$PATH"
+
+                        echo "=== Validating credentials ==="
+                        uv run python -c "
+                        import google.auth
+                        credentials, project = google.auth.default()
+                        print(f'Authenticated to project: {project}')
+                        "
+
+                        echo "GCP credentials configured."
+
+                # ── Step 4: Run tests ──
+                - step:
+                    type: Run
+                    name: Run Tests
+                    identifier: run_tests
+                    spec:
+                      shell: Bash
+                      command: |
+                        export PATH="$HOME/.local/bin:$PATH"
+                        EXIT_CODE=0
+
+                        # Run each test directory/file that exists
+                        if [ -d "tests/unit" ]; then
+                          echo "=== Running unit tests ==="
+                          uv run pytest tests/unit -v --tb=short || EXIT_CODE=1
+                          echo ""
+                        fi
+
+                        if [ -d "tests/integration" ]; then
+                          echo "=== Running integration tests ==="
+                          uv run pytest tests/integration -v --tb=short || EXIT_CODE=1
+                          echo ""
+                        fi
+
+                        # Some agents-cli projects put a top-level test file
+                        if [ -f "tests/test_agents.py" ]; then
+                          echo "=== Running agent tests ==="
+                          uv run pytest tests/test_agents.py -v --tb=short || EXIT_CODE=1
+                          echo ""
+                        fi
+
+                        # Fallback: run all tests if none of the above matched
+                        if [ ! -d "tests/unit" ] && [ ! -d "tests/integration" ] && [ ! -f "tests/test_agents.py" ]; then
+                          echo "=== Running all tests ==="
+                          uv run pytest tests -v --tb=short || EXIT_CODE=1
+                        fi
+
+                        if [ $EXIT_CODE -ne 0 ]; then
+                          echo "FAILED: One or more test suites failed."
+                          exit 1
+                        fi
+                        echo "All tests passed."
+
+                # ── Step 5: Run evaluations ──
+                - step:
+                    type: Run
+                    name: Run Evaluations
+                    identifier: run_evaluations
+                    spec:
+                      shell: Bash
+                      command: |
+                        export PATH="$HOME/.local/bin:$PATH"
+                        export PATH="$(uv tool dir)/bin:$PATH"
+
+                        echo "=== Running agent evaluations ==="
+
+                        # Strategy 1: agents-cli eval run (scaffolded eval suite)
+                        EVAL_CONFIG=$(find tests/eval -name "eval_config.yaml" -o -name "eval_config.json" 2>/dev/null | head -1)
+                        EVAL_DATASET=$(find tests/eval/datasets -name "*.json" 2>/dev/null | head -1)
+
+                        if [ -n "$EVAL_CONFIG" ] && [ -n "$EVAL_DATASET" ]; then
+                          echo "Found eval config: $EVAL_CONFIG"
+                          echo "Found eval dataset: $EVAL_DATASET"
+                          echo "Running: agents-cli eval run"
+                          agents-cli eval run \
+                            --dataset "$EVAL_DATASET" \
+                            --config "$EVAL_CONFIG"
+                          echo "Evaluations completed via agents-cli."
+                          exit 0
+                        fi
+
+                        # Strategy 2: pytest-based eval (older adk-samples pattern)
+                        if [ -d "eval" ]; then
+                          echo "Running evaluations via pytest eval/..."
+                          uv run pytest eval -v --tb=short
+                          echo "Evaluations completed via pytest."
+                          exit 0
+                        fi
+
+                        echo "WARN: No evaluation suite found. Skipping."
+
+                # ── Step 6: Deploy to Agent Runtime ──
+                - step:
+                    type: Run
+                    name: Deploy to Agent Runtime
+                    identifier: deploy_to_agent_runtime
+                    spec:
+                      shell: Bash
+                      command: |
+                        export PATH="$HOME/.local/bin:$PATH"
+                        export PATH="$(uv tool dir)/bin:$PATH"
+
+                        echo "=== Deploying agent to Agent Runtime ==="
+                        echo "Project: $GOOGLE_CLOUD_PROJECT"
+                        echo "Region:  $GOOGLE_CLOUD_LOCATION"
+
+                        agents-cli deploy \
+                          --project "$GOOGLE_CLOUD_PROJECT" \
+                          --region "$GOOGLE_CLOUD_LOCATION" \
+                          --no-confirm-project \
+                          2>&1 | tee /tmp/deploy_output.txt
+                        DEPLOY_EXIT=${PIPESTATUS[0]}
+
+                        if [ $DEPLOY_EXIT -ne 0 ]; then
+                          echo ""
+                          echo "FAILED: Deployment to Agent Runtime failed."
+                          exit 1
+                        fi
+
+                        # Extract and persist the resource name for the smoke test step
+                        RESOURCE_NAME=$(grep -oP 'projects/\S+/reasoningEngines/\S+' /tmp/deploy_output.txt | tail -1 || true)
+                        if [ -z "$RESOURCE_NAME" ]; then
+                          echo "Resource name not found in deploy output. Discovering via --list..."
+                          RESOURCE_NAME=$(agents-cli deploy --list \
+                            --project "$GOOGLE_CLOUD_PROJECT" \
+                            --region "$GOOGLE_CLOUD_LOCATION" 2>&1 \
+                            | grep -oP 'projects/\S+/reasoningEngines/\S+' | tail -1 || true)
+                        fi
+
+                        echo "$RESOURCE_NAME" > /tmp/agent_resource_name.txt
+                        echo ""
+                        echo "Deployment successful."
+                        echo "Resource: ${RESOURCE_NAME:-<unknown>}"
+
+                # ── Step 7: Smoke test the deployed agent ──
+                - step:
+                    type: Run
+                    name: Smoke Test Deployed Agent
+                    identifier: smoke_test_deployed_agent
+                    spec:
+                      shell: Bash
+                      command: |
+                        export PATH="$HOME/.local/bin:$PATH"
+                        export PATH="$(uv tool dir)/bin:$PATH"
+
+                        echo "=== Smoke testing deployed agent ==="
+
+                        RESOURCE_NAME=$(cat /tmp/agent_resource_name.txt 2>/dev/null || echo "")
+
+                        if [ -z "$RESOURCE_NAME" ]; then
+                          echo "Discovering deployed agent resource..."
+                          RESOURCE_NAME=$(agents-cli deploy --list \
+                            --project "$GOOGLE_CLOUD_PROJECT" \
+                            --region "$GOOGLE_CLOUD_LOCATION" 2>&1 \
+                            | grep -oP 'projects/\S+/reasoningEngines/\S+' | tail -1 || true)
+                        fi
+
+                        if [ -z "$RESOURCE_NAME" ]; then
+                          echo "FAIL: Could not determine deployed agent resource."
+                          exit 1
+                        fi
+
+                        PROJECT_NUM=$(echo "$RESOURCE_NAME" | grep -oP 'projects/\K[^/]+')
+                        REGION=$(echo "$RESOURCE_NAME" | grep -oP 'locations/\K[^/]+')
+                        ENGINE_ID=$(echo "$RESOURCE_NAME" | grep -oP 'reasoningEngines/\K\S+')
+                        AGENT_URL="https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_NUM}/locations/${REGION}/reasoningEngines/${ENGINE_ID}"
+
+                        echo "Agent URL: $AGENT_URL"
+                        echo "Sending: 'Hello, what can you help me with?'"
+                        echo ""
+
+                        RESPONSE=$(agents-cli run "Hello, what can you help me with?" \
+                          --url "$AGENT_URL" \
+                          --mode adk \
+                          2>&1) || true
+
+                        echo "=== Agent Response ==="
+                        echo "$RESPONSE"
+                        echo ""
+
+                        if [ -z "$RESPONSE" ]; then
+                          echo "Smoke test FAILED: Empty response from agent."
+                          exit 1
+                        fi
+
+                        if echo "$RESPONSE" | grep -iq "error\|exception\|traceback\|PERMISSION_DENIED"; then
+                          echo "Smoke test FAILED: Agent returned an error."
+                          exit 1
+                        fi
+
+                        echo "Smoke test PASSED: Agent returned a valid response."
+                        echo ""
+                        echo "=== Pipeline Complete ==="
+                        echo "Agent deployed and verified on Agent Runtime."
+                        echo "Resource: $RESOURCE_NAME"
