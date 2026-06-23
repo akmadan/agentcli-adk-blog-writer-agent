@@ -112,31 +112,28 @@ async def stream_reasoning_engine(request: Request):
     if method is None:
         return JSONResponse(status_code=400, content={"error": f"Method '{class_method}' not found."})
 
+    def _serialize(chunk):
+        if isinstance(chunk, dict):
+            return json.dumps(chunk) + "\n"
+        try:
+            return json.dumps(chunk.__dict__) + "\n"
+        except (TypeError, AttributeError):
+            return json.dumps({"data": str(chunk)}) + "\n"
+
     async def generate():
         try:
-            if asyncio.iscoroutinefunction(method):
-                result = method(**input_data)
-                if hasattr(result, "__aiter__"):
-                    async for chunk in result:
-                        if isinstance(chunk, dict):
-                            yield json.dumps(chunk) + "\n"
-                        else:
-                            try:
-                                yield json.dumps(chunk.__dict__) + "\n"
-                            except (TypeError, AttributeError):
-                                yield json.dumps({"data": str(chunk)}) + "\n"
-                else:
-                    r = await result
-                    yield json.dumps(r if isinstance(r, dict) else {"data": str(r)}) + "\n"
+            result = method(**input_data)
+            if hasattr(result, "__aiter__"):
+                async for chunk in result:
+                    yield _serialize(chunk)
+            elif hasattr(result, "__iter__") and not isinstance(result, (str, dict)):
+                for chunk in result:
+                    yield _serialize(chunk)
+            elif asyncio.iscoroutine(result):
+                r = await result
+                yield _serialize(r)
             else:
-                for chunk in method(**input_data):
-                    if isinstance(chunk, dict):
-                        yield json.dumps(chunk) + "\n"
-                    else:
-                        try:
-                            yield json.dumps(chunk.__dict__) + "\n"
-                        except (TypeError, AttributeError):
-                            yield json.dumps({"data": str(chunk)}) + "\n"
+                yield _serialize(result)
         except Exception as e:
             logger.error(f"Stream error in {class_method}: {e}\n{traceback.format_exc()}")
             yield json.dumps({"error": str(e)}) + "\n"
