@@ -1,0 +1,39 @@
+{
+  "eval_set_id": "evalset09be5a",
+  "name": "evalset09be5a",
+  "eval_cases": [
+    {
+      "eval_id": "case866232",
+      "conversation": [
+        {
+          "invocation_id": "e-f6ef7e49-1563-457f-8b0c-3cd1cc469015",
+          "user_content": {
+            "parts": [
+              {
+                "text": "hey"
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "Hello! I am an AI Research Assistant.\n\nI can help you analyze a seminal academic paper, find recent work that cites it, and suggest potential future research directions.\n\nTo get started, please provide the seminal paper you would like me to analyze as a PDF.",
+                "thought_signature": "Cp0BAY89a18Ra0ERsHkXL6KlIlcJHNtFdsxlsoGw4SWgognp6yPioYrsbDPVAj5-Iu9aHm1_yW-PZcMo602z3bF8c_UTlG1MHXlqfdR3FqrtkpSCloocHKWazRtzQOb6VrzPQ_4gDlTGxe-kw4ldmkbxCJ03DpsLN8RyHjkjlmr3MA1QRUSRrXi1xZye4roFvOhmRqYRVxRilHkV5-gI4A=="
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {},
+          "creation_timestamp": 1782110360.589762
+        }
+      ],
+      "session_input": {
+        "app_name": "academic_research",
+        "user_id": "user"
+      },
+      "creation_timestamp": 1782115686.62798
+    }
+  ],
+  "creation_timestamp": 1782115682.357311
+}
