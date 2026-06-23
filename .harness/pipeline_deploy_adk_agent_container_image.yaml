@@ -213,6 +213,13 @@ template:
                         NEW_REVISION=$(curl -s -H "Authorization: Bearer $TOKEN" "${API_BASE}/${RESOURCE_NAME}/runtimeRevisions" | python3 -c "import sys,json; revs=json.load(sys.stdin).get('reasoningEngineRuntimeRevisions',[]); revs.sort(key=lambda r:r.get('createTime',''),reverse=True); print(revs[0]['name']) if revs else ''" 2>/dev/null || true)
                         echo "$NEW_REVISION" > /tmp/new_revision.txt
                         echo "New revision: $NEW_REVISION"
+                        OLD_REVISION=$(cat /tmp/old_revision.txt 2>/dev/null || echo "")
+                        CURRENT_AGENT_ID=$(echo "$RESOURCE_NAME" | grep -oP 'reasoningEngines/\K[^/]+')
+                        OLD_AGENT_ID=$(echo "$OLD_REVISION" | grep -oP 'reasoningEngines/\K[^/]+' || true)
+                        if [ -n "$OLD_REVISION" ] && [ "$OLD_AGENT_ID" != "$CURRENT_AGENT_ID" ]; then
+                          echo "Old revision is from a different agent ($OLD_AGENT_ID vs $CURRENT_AGENT_ID). Clearing for fresh deployment."
+                          echo "" > /tmp/old_revision.txt
+                        fi
                 - step:
                     type: Run
                     name: Canary Traffic Split
@@ -251,8 +258,10 @@ template:
                         fi
                         API_BASE="https://${GOOGLE_CLOUD_LOCATION}-aiplatform.googleapis.com/v1beta1"
                         TOKEN=$(gcloud auth print-access-token)
+                        echo "=== Waiting 30s for container to stabilize ==="
+                        sleep 30
                         echo "=== Smoke testing deployed agent ==="
-                        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"class_method":"list_sessions","input":{"user_id":"smoke-test"}}' "${API_BASE}/${RESOURCE_NAME}:query") || true
+                        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"class_method":"async_list_sessions","input":{"user_id":"smoke-test"}}' "${API_BASE}/${RESOURCE_NAME}:query") || true
                         HTTP_CODE=$(echo "$RESPONSE" | tail -1)
                         BODY=$(echo "$RESPONSE" | head -n -1)
                         echo "HTTP Status: $HTTP_CODE"
@@ -263,7 +272,7 @@ template:
                         elif [ "$HTTP_CODE" = "503" ] || [ "$HTTP_CODE" = "429" ]; then
                           echo "Agent may still be starting. Waiting 30s..."
                           sleep 30
-                          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"class_method":"list_sessions","input":{"user_id":"smoke-test"}}' "${API_BASE}/${RESOURCE_NAME}:query") || true
+                          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"class_method":"async_list_sessions","input":{"user_id":"smoke-test"}}' "${API_BASE}/${RESOURCE_NAME}:query") || true
                           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
                           if [ "$HTTP_CODE" = "200" ]; then echo "PASS" > /tmp/smoke_result.txt; echo "Smoke test PASSED on retry."; else echo "FAIL" > /tmp/smoke_result.txt; echo "Smoke test FAILED after retry."; fi
                         else
