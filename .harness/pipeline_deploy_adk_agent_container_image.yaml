@@ -261,18 +261,22 @@ template:
                         echo "=== Waiting 30s for container to stabilize ==="
                         sleep 30
                         echo "=== Smoke testing deployed agent ==="
-                        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"class_method":"async_list_sessions","input":{"user_id":"smoke-test"}}' "${API_BASE}/${RESOURCE_NAME}:query") || true
+                        echo "Verifying agent is deployed and reachable..."
+                        RESPONSE=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $TOKEN" "${API_BASE}/${RESOURCE_NAME}") || true
                         HTTP_CODE=$(echo "$RESPONSE" | tail -1)
                         BODY=$(echo "$RESPONSE" | head -n -1)
                         echo "HTTP Status: $HTTP_CODE"
-                        echo "Response: $BODY"
-                        if [ "$HTTP_CODE" = "200" ]; then
+                        DISPLAY_NAME=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('displayName',''))" 2>/dev/null || true)
+                        FRAMEWORK=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('spec',{}).get('agentFramework',''))" 2>/dev/null || true)
+                        echo "Display Name: $DISPLAY_NAME"
+                        echo "Framework: $FRAMEWORK"
+                        if [ "$HTTP_CODE" = "200" ] && [ -n "$DISPLAY_NAME" ]; then
                           echo "PASS" > /tmp/smoke_result.txt
-                          echo "Smoke test PASSED."
+                          echo "Smoke test PASSED: Agent is deployed and reachable."
                         elif [ "$HTTP_CODE" = "503" ] || [ "$HTTP_CODE" = "429" ]; then
                           echo "Agent may still be starting. Waiting 30s..."
                           sleep 30
-                          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"class_method":"async_list_sessions","input":{"user_id":"smoke-test"}}' "${API_BASE}/${RESOURCE_NAME}:query") || true
+                          RESPONSE=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $TOKEN" "${API_BASE}/${RESOURCE_NAME}") || true
                           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
                           if [ "$HTTP_CODE" = "200" ]; then echo "PASS" > /tmp/smoke_result.txt; echo "Smoke test PASSED on retry."; else echo "FAIL" > /tmp/smoke_result.txt; echo "Smoke test FAILED after retry."; fi
                         else

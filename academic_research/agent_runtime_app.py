@@ -36,8 +36,12 @@ class AgentEngineApp(AdkApp):
         setup_telemetry()
         super().set_up()
         logging.basicConfig(level=logging.INFO)
-        logging_client = google_cloud_logging.Client()
-        self.logger = logging_client.logger(__name__)
+        try:
+            logging_client = google_cloud_logging.Client()
+            self.logger = logging_client.logger(__name__)
+        except Exception as e:
+            logging.warning(f"Cloud logging init failed (using stdlib): {e}")
+            self.logger = logging.getLogger(__name__)
         if gemini_location:
             os.environ["GOOGLE_CLOUD_LOCATION"] = gemini_location
 

@@ -6,9 +6,3 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY academic_research/ ./academic_research/
-COPY server.py .
-
-ENV PORT=8080
-EXPOSE 8080
-
-CMD ["python", "server.py"]
