@@ -1,0 +1,21 @@
+{
+  "name": "AcademicResearch",
+  "resources": {
+    "runtimes": {
+      "AcademicResearch": {
+        "language": "Python",
+        "framework": "GoogleADK",
+        "protocol": "HTTP",
+        "modelProvider": "Gemini",
+        "build": "CodeZip",
+        "entrypoint": "main.py",
+        "credentials": ["GEMINI_API_KEY"]
+      }
+    },
+    "credentials": {
+      "GEMINI_API_KEY": {
+        "type": "api-key"
+      }
+    }
+  }
+}

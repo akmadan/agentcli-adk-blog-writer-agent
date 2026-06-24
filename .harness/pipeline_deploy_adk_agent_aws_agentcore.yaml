@@ -1,0 +1,468 @@
+template:
+  name: ADK Deployment to AWS AgentCore with Gateway Traffic
+  identifier: ADK_Deployment_to_AWS_AgentCore_with_Gateway_Traffic
+  versionLabel: v1
+  type: Pipeline
+  projectIdentifier: akshitdevrelharness
+  orgIdentifier: default
+  tags:
+    framework: google-adk
+    runtime: aws-agentcore
+    traffic: gateway
+  spec:
+    stages:
+      - stage:
+          name: CI - Validate and Test
+          identifier: ci_validate_and_test
+          description: Clone repo, validate AgentCore project structure, run tests
+          type: CI
+          spec:
+            cloneCodebase: false
+            platform:
+              os: Linux
+              arch: Amd64
+            runtime:
+              type: Cloud
+              spec: {}
+            execution:
+              steps:
+                - step:
+                    type: GitClone
+                    name: Git Clone
+                    identifier: git_clone
+                    spec:
+                      connectorRef: <+input>
+                      repoName: <+input>
+                      build:
+                        type: branch
+                        spec:
+                          branch: <+input>
+                - step:
+                    name: Validate Project Structure
+                    identifier: validate_structure
+                    type: Run
+                    spec:
+                      shell: Bash
+                      command: |-
+                        echo "=== Validating AgentCore project structure ==="
+                        REPO=$(ls /harness | head -1)
+                        BASE="/harness/$REPO/<+pipeline.variables.agentSubPath>"
+                        for f in "agentcore/agentcore.json" "app/<+pipeline.variables.runtimeName>/<+pipeline.variables.entrypoint>"; do
+                          if [ ! -f "$BASE/$f" ]; then echo "FAIL: Missing $f"; exit 1; fi
+                          echo "  OK: $f"
+                        done
+                        echo "=== Validation passed ==="
+                        cat "$BASE/agentcore/agentcore.json"
+                - step:
+                    name: Install and Test
+                    identifier: install_and_test
+                    type: Run
+                    spec:
+                      image: node:20-slim
+                      shell: Bash
+                      envVariables:
+                        AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                        AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                        AWS_SESSION_TOKEN: <+secrets.getValue("aws_session_token")>
+                        AWS_DEFAULT_REGION: <+pipeline.variables.awsRegion>
+                      command: |-
+                        REPO=$(ls /harness | head -1)
+                        BASE="/harness/$REPO/<+pipeline.variables.agentSubPath>"
+                        AGENT_DIR="$BASE/app/<+pipeline.variables.runtimeName>"
+                        if [ -f "$AGENT_DIR/pyproject.toml" ] || [ -f "$AGENT_DIR/requirements.txt" ]; then
+                          apt-get update -qq && apt-get install -y python3 python3-venv python3-pip --quiet
+                          cd "$AGENT_DIR"
+                          if [ -f "pyproject.toml" ]; then
+                            curl -LsSf https://astral.sh/uv/install.sh | sh
+                            export PATH="$HOME/.local/bin:$PATH"
+                            uv sync 2>/dev/null || uv pip install -r requirements.txt 2>/dev/null || true
+                            TEST_CMD="uv run pytest"
+                          else
+                            pip install -r requirements.txt 2>/dev/null || true
+                            pip install pytest pytest-asyncio 2>/dev/null || true
+                            TEST_CMD="pytest"
+                          fi
+                          if [ -d "tests" ]; then
+                            echo "=== Running tests ==="
+                            $TEST_CMD tests -v --tb=short || echo "WARN: Tests failed (non-blocking in CI)."
+                          else
+                            echo "WARN: No tests/ directory found."
+                          fi
+                        else
+                          echo "WARN: No pyproject.toml or requirements.txt found. Skipping tests."
+                        fi
+                        echo "CI stage complete."
+      - stage:
+          name: CD - Deploy with Gateway Traffic
+          identifier: cd_deploy_with_gateway
+          description: Deploy to AgentCore Runtime, manage Gateway canary traffic, smoke test, promote or rollback
+          type: CI
+          spec:
+            cloneCodebase: false
+            platform:
+              os: Linux
+              arch: Amd64
+            runtime:
+              type: Cloud
+              spec: {}
+            execution:
+              steps:
+                - step:
+                    type: GitClone
+                    name: Git Clone
+                    identifier: cd_git_clone
+                    spec:
+                      connectorRef: <+input>
+                      repoName: <+input>
+                      build:
+                        type: branch
+                        spec:
+                          branch: <+input>
+                - step:
+                    name: Setup and Deploy Agent
+                    identifier: setup_and_deploy
+                    type: Run
+                    spec:
+                      image: node:20-slim
+                      shell: Bash
+                      envVariables:
+                        AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                        AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                        AWS_SESSION_TOKEN: <+secrets.getValue("aws_session_token")>
+                        AWS_DEFAULT_REGION: <+pipeline.variables.awsRegion>
+                        GEMINI_API_KEY: <+secrets.getValue("agentcore_gemini_key")>
+                        CI: "true"
+                      command: |-
+                        set -euo pipefail
+                        apt-get update -qq && apt-get install -y python3 python3-venv python3-pip curl awscli jq --quiet
+                        curl -LsSf https://astral.sh/uv/install.sh | sh
+                        export PATH="$HOME/.local/bin:$PATH"
+                        npm install -g @aws/agentcore typescript@5.7 --quiet
+                        pip install --quiet boto3
+                        aws sts get-caller-identity
+                        REPO=$(ls /harness | head -1)
+                        PROJECT_DIR="/harness/$REPO/<+pipeline.variables.agentSubPath>"
+                        cd "$PROJECT_DIR"
+                        cd agentcore/cdk && npm install --quiet && cd "$PROJECT_DIR"
+                        printf 'AGENTCORE_CREDENTIAL_<+pipeline.variables.credentialEnvName>=%s\n' "$GEMINI_API_KEY" > agentcore/.env.local
+                        cat > agentcore/aws-targets.json << 'TGTEOF'
+                        [{"name":"default","description":"Deployed via Harness CI","account":"<+pipeline.variables.awsAccountId>","region":"<+pipeline.variables.awsRegion>"}]
+                        TGTEOF
+                        sed -i 's/^[[:space:]]*//' agentcore/aws-targets.json
+                        echo "=== Deploying agent ==="
+                        agentcore deploy --yes 2>&1 | tee /tmp/deploy.log
+                        echo "=== Getting endpoint ARN ==="
+                        if [ -f "agentcore/.cli/deployed-state.json" ]; then
+                          cat agentcore/.cli/deployed-state.json > /tmp/deployed-state.json
+                          ENDPOINT_ARN=$(python3 -c "
+                        import json
+                        with open('/tmp/deployed-state.json') as f:
+                            state = json.load(f)
+                        for stack in state.get('stacks', state.get('Stacks', [state])):
+                            outputs = stack.get('Outputs', stack.get('outputs', {}))
+                            if isinstance(outputs, list):
+                                for o in outputs:
+                                    if 'Runtime' in o.get('OutputKey','') or 'Arn' in o.get('OutputKey',''):
+                                        print(o['OutputValue']); break
+                            elif isinstance(outputs, dict):
+                                for k,v in outputs.items():
+                                    if 'runtime' in k.lower() or 'arn' in k.lower():
+                                        print(v); break
+                        " 2>/dev/null || true)
+                        fi
+                        if [ -z "${ENDPOINT_ARN:-}" ]; then
+                          ENDPOINT_ARN=$(agentcore status 2>&1 | grep -oP 'arn:aws:bedrock-agentcore:[^[:space:]]+' | head -1 || true)
+                        fi
+                        echo "$ENDPOINT_ARN" > /tmp/endpoint_arn.txt
+                        echo "Endpoint ARN: $ENDPOINT_ARN"
+                        echo "Deploy complete."
+                - step:
+                    name: Capture Gateway State and Register Target
+                    identifier: capture_and_register
+                    type: Run
+                    spec:
+                      image: node:20-slim
+                      shell: Bash
+                      envVariables:
+                        AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                        AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                        AWS_SESSION_TOKEN: <+secrets.getValue("aws_session_token")>
+                        AWS_DEFAULT_REGION: <+pipeline.variables.awsRegion>
+                      command: |-
+                        apt-get update -qq && apt-get install -y python3 python3-pip --quiet
+                        pip install --quiet boto3
+                        GATEWAY_ID="<+pipeline.variables.gatewayId>"
+                        ENDPOINT_ARN=$(cat /tmp/endpoint_arn.txt 2>/dev/null || echo "")
+                        RUNTIME_NAME="<+pipeline.variables.runtimeName>"
+                        BUILD_ID="<+pipeline.sequenceId>"
+                        if [ -z "$GATEWAY_ID" ] || [ "$GATEWAY_ID" = "null" ] || [ "$GATEWAY_ID" = "<+input>" ]; then
+                          echo "No Gateway ID provided. Skipping traffic management."
+                          echo "" > /tmp/old_target.txt
+                          echo "" > /tmp/new_target.txt
+                          echo "" > /tmp/canary_rule_id.txt
+                          exit 0
+                        fi
+                        echo "=== Capturing Gateway state and registering target ==="
+                        python3 -c "
+                        import boto3, json, os
+                        client = boto3.client('bedrock-agentcore-control', region_name=os.environ['AWS_DEFAULT_REGION'])
+                        gateway_id = '$GATEWAY_ID'
+                        endpoint_arn = '$ENDPOINT_ARN'
+                        runtime_name = '$RUNTIME_NAME'
+                        build_id = '$BUILD_ID'
+                        # List existing targets to find the current primary
+                        print('Listing existing targets...')
+                        targets = client.list_gateway_targets(gatewayIdentifier=gateway_id)
+                        old_target = ''
+                        for t in targets.get('items', []):
+                            if t.get('status') == 'READY' and t.get('targetType') == 'AGENTCORE_RUNTIME':
+                                old_target = t['name']
+                                print(f'Found existing target: {old_target} (id={t[\"targetId\"]})')
+                                break
+                        with open('/tmp/old_target.txt', 'w') as f:
+                            f.write(old_target)
+                        # Register new target
+                        if not endpoint_arn:
+                            print('WARN: No endpoint ARN found. Skipping target registration.')
+                            with open('/tmp/new_target.txt', 'w') as f:
+                                f.write('')
+                            exit(0)
+                        new_target_name = f'{runtime_name}-canary-{build_id}'
+                        print(f'Creating new Gateway target: {new_target_name}')
+                        try:
+                            resp = client.create_gateway_target(
+                                gatewayIdentifier=gateway_id,
+                                name=new_target_name,
+                                targetConfiguration={
+                                    'agentRuntime': {'agentRuntimeArn': endpoint_arn}
+                                },
+                                credentialProviderConfigurations=[
+                                    {'credentialProviderType': 'GATEWAY_IAM_ROLE'}
+                                ]
+                            )
+                            print(f'Target created: {resp.get(\"name\", new_target_name)} status={resp.get(\"status\")}')
+                        except Exception as e:
+                            print(f'WARN: Failed to create target: {e}')
+                            new_target_name = ''
+                        with open('/tmp/new_target.txt', 'w') as f:
+                            f.write(new_target_name)
+                        "
+                - step:
+                    name: Canary Traffic Split
+                    identifier: canary_traffic_split
+                    type: Run
+                    spec:
+                      image: node:20-slim
+                      shell: Bash
+                      envVariables:
+                        AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                        AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                        AWS_SESSION_TOKEN: <+secrets.getValue("aws_session_token")>
+                        AWS_DEFAULT_REGION: <+pipeline.variables.awsRegion>
+                      command: |-
+                        apt-get update -qq && apt-get install -y python3 python3-pip --quiet
+                        pip install --quiet boto3
+                        GATEWAY_ID="<+pipeline.variables.gatewayId>"
+                        OLD_TARGET=$(cat /tmp/old_target.txt 2>/dev/null || echo "")
+                        NEW_TARGET=$(cat /tmp/new_target.txt 2>/dev/null || echo "")
+                        if [ -z "$GATEWAY_ID" ] || [ -z "$OLD_TARGET" ] || [ -z "$NEW_TARGET" ]; then
+                          echo "Skipping canary -- missing Gateway ID, old target, or new target."
+                          echo "" > /tmp/canary_rule_id.txt
+                          exit 0
+                        fi
+                        echo "=== Creating canary rule: 90% $OLD_TARGET / 10% $NEW_TARGET ==="
+                        python3 -c "
+                        import boto3, json, os
+                        client = boto3.client('bedrock-agentcore-control', region_name=os.environ['AWS_DEFAULT_REGION'])
+                        gateway_id = '$GATEWAY_ID'
+                        old_target = '$OLD_TARGET'
+                        new_target = '$NEW_TARGET'
+                        try:
+                            resp = client.create_gateway_rule(
+                                gatewayIdentifier=gateway_id,
+                                priority=300,
+                                description='Harness CI canary: 90/10 split',
+                                actions=[{
+                                    'routeToTarget': {
+                                        'weightedRoute': {
+                                            'trafficSplit': [
+                                                {'name': 'primary', 'weight': 90, 'targetName': old_target},
+                                                {'name': 'canary', 'weight': 10, 'targetName': new_target}
+                                            ]
+                                        }
+                                    }
+                                }]
+                            )
+                            rule_id = resp.get('ruleIdentifier', resp.get('ruleId', ''))
+                            print(f'Canary rule created: {rule_id}')
+                            with open('/tmp/canary_rule_id.txt', 'w') as f:
+                                f.write(str(rule_id))
+                        except Exception as e:
+                            print(f'WARN: Failed to create canary rule: {e}')
+                            with open('/tmp/canary_rule_id.txt', 'w') as f:
+                                f.write('')
+                        "
+                - step:
+                    name: Smoke Test
+                    identifier: smoke_test
+                    type: Run
+                    spec:
+                      image: node:20-slim
+                      shell: Bash
+                      envVariables:
+                        AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                        AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                        AWS_SESSION_TOKEN: <+secrets.getValue("aws_session_token")>
+                        AWS_DEFAULT_REGION: <+pipeline.variables.awsRegion>
+                        CI: "true"
+                      command: |-
+                        npm install -g @aws/agentcore --quiet 2>/dev/null || true
+                        REPO=$(ls /harness | head -1)
+                        PROJECT_DIR="/harness/$REPO/<+pipeline.variables.agentSubPath>"
+                        cd "$PROJECT_DIR"
+                        echo "=== Waiting 30s for agent to stabilize ==="
+                        sleep 30
+                        echo "=== Smoke testing agent ==="
+                        RESPONSE=$(agentcore invoke --runtime <+pipeline.variables.runtimeName> '{"prompt":"Hello, are you there? Reply in one sentence."}' 2>&1) || true
+                        echo "Response: $RESPONSE"
+                        if [ -z "$RESPONSE" ]; then
+                          echo "WARN: Empty response. Agent may still be starting."
+                          echo "FAIL" > /tmp/smoke_result.txt
+                          exit 0
+                        fi
+                        if echo "$RESPONSE" | grep -iq "error\|exception\|traceback\|AccessDenied"; then
+                          echo "FAIL" > /tmp/smoke_result.txt
+                          echo "Smoke test FAILED."
+                          exit 0
+                        fi
+                        echo "PASS" > /tmp/smoke_result.txt
+                        echo "Smoke test PASSED."
+                - step:
+                    name: Promote or Rollback
+                    identifier: promote_or_rollback
+                    type: Run
+                    spec:
+                      image: node:20-slim
+                      shell: Bash
+                      envVariables:
+                        AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                        AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                        AWS_SESSION_TOKEN: <+secrets.getValue("aws_session_token")>
+                        AWS_DEFAULT_REGION: <+pipeline.variables.awsRegion>
+                      command: |-
+                        apt-get update -qq && apt-get install -y python3 python3-pip --quiet
+                        pip install --quiet boto3
+                        SMOKE_RESULT=$(cat /tmp/smoke_result.txt 2>/dev/null || echo "FAIL")
+                        GATEWAY_ID="<+pipeline.variables.gatewayId>"
+                        OLD_TARGET=$(cat /tmp/old_target.txt 2>/dev/null || echo "")
+                        NEW_TARGET=$(cat /tmp/new_target.txt 2>/dev/null || echo "")
+                        CANARY_RULE_ID=$(cat /tmp/canary_rule_id.txt 2>/dev/null || echo "")
+                        if [ -z "$GATEWAY_ID" ] || [ -z "$CANARY_RULE_ID" ]; then
+                          echo "No Gateway or canary rule. Skipping traffic management."
+                          if [ "$SMOKE_RESULT" = "PASS" ]; then
+                            echo "Pipeline PASSED. Agent deployed (no Gateway traffic management)."
+                          else
+                            echo "WARN: Smoke test did not pass. Agent deployed but may need investigation."
+                          fi
+                          exit 0
+                        fi
+                        echo "=== Smoke result: $SMOKE_RESULT ==="
+                        python3 -c "
+                        import boto3, os
+                        client = boto3.client('bedrock-agentcore-control', region_name=os.environ['AWS_DEFAULT_REGION'])
+                        gateway_id = '$GATEWAY_ID'
+                        old_target = '$OLD_TARGET'
+                        new_target = '$NEW_TARGET'
+                        rule_id = '$CANARY_RULE_ID'
+                        smoke = '$SMOKE_RESULT'
+                        if smoke == 'PASS':
+                            print(f'PROMOTING: Sending 100% traffic to {new_target}')
+                            try:
+                                client.update_gateway_rule(
+                                    gatewayIdentifier=gateway_id,
+                                    ruleIdentifier=rule_id,
+                                    actions=[{
+                                        'routeToTarget': {
+                                            'staticRoute': {'targetName': new_target}
+                                        }
+                                    }]
+                                )
+                                print(f'Traffic promoted to {new_target}.')
+                                if old_target:
+                                    print(f'Old target {old_target} still exists. Remove manually when ready.')
+                            except Exception as e:
+                                print(f'WARN: Failed to promote: {e}')
+                        else:
+                            print(f'ROLLING BACK: Restoring 100% traffic to {old_target}')
+                            try:
+                                client.update_gateway_rule(
+                                    gatewayIdentifier=gateway_id,
+                                    ruleIdentifier=rule_id,
+                                    actions=[{
+                                        'routeToTarget': {
+                                            'staticRoute': {'targetName': old_target}
+                                        }
+                                    }]
+                                )
+                                print(f'Traffic restored to {old_target}.')
+                            except Exception as e:
+                                print(f'WARN: Failed to rollback rule: {e}')
+                            # Clean up canary target
+                            if new_target:
+                                try:
+                                    targets = client.list_gateway_targets(gatewayIdentifier=gateway_id)
+                                    for t in targets.get('items', []):
+                                        if t.get('name') == new_target:
+                                            client.delete_gateway_target(gatewayIdentifier=gateway_id, targetIdentifier=t['targetId'])
+                                            print(f'Canary target {new_target} deleted.')
+                                            break
+                                except Exception as e:
+                                    print(f'WARN: Failed to delete canary target: {e}')
+                            print(f'Rollback complete.')
+                        print('')
+                        print(f'Old target: {old_target}')
+                        print(f'New target: {new_target}')
+                        print(f'Rule ID: {rule_id}')
+                        "
+    variables:
+      - name: agentSubPath
+        type: String
+        description: Path to the agentcore project folder inside the repo
+        default: blogwriter
+        value: <+input>
+        required: true
+      - name: awsRegion
+        type: String
+        description: AWS region to deploy to
+        default: us-east-1
+        value: <+input>
+        required: true
+      - name: awsAccountId
+        type: String
+        description: AWS account ID (12 digits)
+        value: <+input>
+        required: true
+      - name: runtimeName
+        type: String
+        description: AgentCore runtime name (must match agentcore.json)
+        default: BlogWriter
+        value: <+input>
+        required: true
+      - name: entrypoint
+        type: String
+        description: Agent entrypoint file name
+        default: main.py
+        value: <+input>
+        required: true
+      - name: credentialEnvName
+        type: String
+        description: Credential env var suffix for AGENTCORE_CREDENTIAL_<name>
+        default: BLOGWRITERGEMINI
+        value: <+input>
+        required: true
+      - name: gatewayId
+        type: String
+        description: AgentCore Gateway identifier for traffic management (leave empty to skip)
+        default: ""
+        value: <+input>
+        required: false
